@@ -1475,6 +1475,48 @@ def forward(self, x_1: "f32[2][1]cpu"):
 
             self.assertParses()
 
+    @contextmanager
+    def _setup_graph_execution_capture(self):
+        """Helper to capture the 'graph_execution' structured trace."""
+        payload_buffer = io.StringIO()
+        payload_handler = logging.StreamHandler(payload_buffer)
+        payload_handler.setLevel(logging.DEBUG)
+        payload_handler.setFormatter(StructuredTracePayloadFormatter())
+        payload_handler.addFilter(StructuredTraceTestingFilter("graph_execution"))
+        trace_log.addHandler(payload_handler)
+        try:
+            yield payload_buffer
+        finally:
+            trace_log.removeHandler(payload_handler)
+
+    def test_graph_execution_order(self):
+        """Verify graph execution order is aggregated into a single artifact."""
+        with self._setup_graph_execution_capture() as payload_buffer:
+            torch._dynamo.reset()
+
+            def fn(x):
+                y = x + 1
+                torch._dynamo.graph_break()
+                return y + 2
+
+            compiled = torch.compile(fn, backend="inductor")
+            from torch._inductor.debug import record_and_log_graph_execution_order
+
+            with record_and_log_graph_execution_order():
+                compiled(torch.randn(1))
+
+            payload_content = payload_buffer.getvalue().strip()
+            payload = json.loads(payload_content)
+            executions = payload["graph_execution_order"]
+            self.assertTrue(all(isinstance(e["compile_id"], str) for e in executions))
+            for e in executions:
+                e["compile_id"] = "CID"
+            self.assertExpectedInline(
+                json.dumps(payload, sort_keys=True),
+                """{"graph_execution_order": [{"compile_id": "CID"}, {"compile_id": "CID"}]}""",
+            )
+            self.assertParses()
+
 
 if __name__ == "__main__":
     from torch._dynamo.test_case import run_tests
